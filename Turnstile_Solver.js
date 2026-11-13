@@ -16,38 +16,8 @@ function getArg(flags, envVal, defaultVal) {
 
 const PORT = parseInt(getArg(['--port', '-P'], process.env.PORT, '6767'), 10);
 const POOL_SIZE = parseInt(getArg(['--pool', '-p'], process.env.POOL_SIZE, '5'), 10);
-const TIMEOUT = 45;
-// Concurrent solve limits per lane: requests beyond the limit QUEUE instead
-// of all landing on the browser at once.
-// - headful (interactive challenges): CPU-bound, peaks at 10 on 8 vCPU
-//   (measured: 15 and 20 are slower AND less accurate)
-// - headless (non-interactive challenges): pages are ~5x lighter, peaks at 20
-const MAX_CONCURRENT = parseInt(getArg(['--max-concurrent'], process.env.MAX_CONCURRENT, '3'), 10);
-const MAX_HEADLESS = parseInt(getArg(['--max-concurrent-headless'], process.env.MAX_CONCURRENT_HEADLESS, '20'), 10);
-const MAX_HEADFUL = parseInt(getArg(['--max-concurrent-headful'], process.env.MAX_CONCURRENT_HEADFUL, String(MAX_CONCURRENT)), 10);
-const LIMITS = { headless: MAX_HEADLESS, headful: MAX_HEADFUL };
-const solving = { headless: 0, headful: 0 };
-const waitQueue = { headless: [], headful: [] };
-
-function acquireSlot(lane) {
-    return new Promise(resolve => {
-        if (solving[lane] < LIMITS[lane]) { solving[lane]++; resolve(); }
-        else waitQueue[lane].push(resolve);
-    });
-}
-
-function releaseSlot(lane) {
-    solving[lane]--;
-    const next = waitQueue[lane].shift();
-    if (next) { solving[lane]++; next(); }
-}
+const TIMEOUT = 30;
 const HEADLESS = getArg('--headless', process.env.HEADLESS, 'false') === 'true';
-const CLEAR_COOKIES = getArg('--clear-cookies', process.env.CLEAR_COOKIES, 'false') === 'true';
-// MODE: headless | headful | hybrid (default). Hybrid solves on the cheap
-// headless lane first and escalates to headful (Xvfb) only when the site
-// serves an interactive challenge — which headless cannot pass (verified:
-// plain Playwright and rebrowser-patched drivers both fail it).
-const MODE = (getArg('--mode', process.env.MODE, HEADLESS ? 'headless' : 'hybrid')).toLowerCase();
 
 const HTML_UI = `<!DOCTYPE html>
 <html lang="en">
@@ -439,6 +409,23 @@ function buildPage(siteKey, action, cData) {
 </html>`;
 }
 
+let browser;
+const ctxPool = [];
+
+async function grabCtx() {
+    if (ctxPool.length > 0) return ctxPool.shift();
+    return await browser.newContext({ viewport: { width: 1280, height: 720 } });
+}
+
+async function dropCtx(ctx) {
+    if (ctxPool.length < POOL_SIZE) {
+        await ctx.clearCookies().catch(() => {});
+        ctxPool.push(ctx);
+    } else {
+        await ctx.close().catch(() => {});
+    }
+}
+
 function findPatchrightExe() {
     for (const py of ['python3', 'python']) {
         try {
@@ -471,206 +458,32 @@ function findPatchrightExe() {
     return null;
 }
 
-async function launchBrowser(headlessFlag) {
-    const exePath = findPatchrightExe();
-    if (exePath) {
-        console.log(`[INFO] Using Chromium binary: ${exePath}`);
-    } else {
-        console.log(`[WARN] Patchright/custom Chromium not found, falling back to default Playwright browser`);
-    }
-
-    return await chromium.launch({
-        executablePath: exePath || undefined,
-        headless: headlessFlag,
-        args: [
-            '--no-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-blink-features=AutomationControlled',
-            '--no-first-run',
-            // Software GL: without this the GPU process can crash under Xvfb
-            // (no real GLX), and Turnstile's interactive challenge takes the
-            // whole browser down with it. WebGL still works via SwiftShader.
-            '--disable-gpu'
-        ]
-    });
-}
-
-// Two lanes: a cheap headless one and a headful one (needs a display, e.g.
-// Xvfb). The headful browser launches lazily, only when an interactive
-// challenge actually requires it — deployments that never see interactive
-// challenges stay purely headless and low-RAM.
-const browsers = { headless: null, headful: null };
-const pools = { headless: [], headful: [] };
-// Sitekeys seen serving interactive challenges: solved on the headful lane
-// directly, skipping the futile headless attempt.
-const interactiveSites = new Set();
-
-// Relaunch a lane's browser and rebuild its pool when the process has died
-// (OOM, GPU abort, font crash): a single crash used to leave dead contexts
-// in the pool and the service returning 500s until a manual restart.
-// Concurrent callers share one in-flight launch — without this, N solves
-// escalating at once would each spawn their own browser.
-const ensureInFlight = {};
-async function ensureBrowser(lane) {
-    if (browsers[lane] && browsers[lane].isConnected()) return;
-    if (!ensureInFlight[lane]) {
-        ensureInFlight[lane] = (async () => {
-            console.log(`[INFO] ${lane} browser down, relaunching and rebuilding pool...`);
-            try {
-                await browsers[lane]?.close().catch(() => {});
-                browsers[lane] = await launchBrowser(lane === 'headless');
-                pools[lane].length = 0;
-                for (let i = 0; i < POOL_SIZE; i++) {
-                    pools[lane].push(await browsers[lane].newContext({ viewport: { width: 1280, height: 720 } }));
-                }
-                console.log(`[INFO] ${lane} browser relaunched, pool rebuilt (${POOL_SIZE} contexts)`);
-            } catch (e) {
-                throw new Error(
-                    `cannot launch ${lane} browser: ${e.message}` +
-                    (lane === 'headful' ? ' (headful needs a display — run under Xvfb: npm run start:xvfb)' : '')
-                );
-            } finally {
-                delete ensureInFlight[lane];
-            }
-        })();
-    }
-    return ensureInFlight[lane];
-}
-
-async function grabCtx(lane) {
-    if (pools[lane].length > 0) return pools[lane].shift();
-    await ensureBrowser(lane);
-    return await browsers[lane].newContext({ viewport: { width: 1280, height: 720 } });
-}
-
-// By default contexts keep their cookies between solves: warm
-// challenges.cloudflare.com cookies make repeat solves faster (often skipping
-// the interactive step). Pass --clear-cookies for the old isolation behavior.
-async function dropCtx(ctx, lane) {
-    if (pools[lane].length < POOL_SIZE) {
-        if (CLEAR_COOKIES) await ctx.clearCookies().catch(() => {});
-        pools[lane].push(ctx);
-    } else {
-        await ctx.close().catch(() => {});
-    }
-}
-
-// Route a solve to the right lane: known-interactive sitekeys and --mode
-// headful go straight to headful; everything else starts on the cheap
-// headless lane and escalates on the first interactiveBegin.
 async function solve(siteUrl, siteKey, timeout = TIMEOUT, action, cData) {
-    const startLane = (MODE === 'headful' || interactiveSites.has(siteKey)) ? 'headful' : 'headless';
-
-    if (startLane === 'headless' && MODE === 'hybrid') {
-        await acquireSlot('headless');
-        let escalate = false;
-        try {
-            const first = await solveOnce(siteUrl, siteKey, timeout, action, cData, 'headless', false);
-            if (first.__escalate) {
-                escalate = true;
-            } else {
-                return first;
-            }
-        } finally {
-            releaseSlot('headless');
-        }
-        if (escalate) {
-            interactiveSites.add(siteKey);
-            console.log(`[INFO] Interactive challenge needs the headful lane; ${siteKey} goes there directly from now on`);
-            await acquireSlot('headful');
-            try {
-                return await solveOnce(siteUrl, siteKey, timeout, action, cData, 'headful', true);
-            } finally {
-                releaseSlot('headful');
-            }
-        }
-    }
-
-    await acquireSlot(startLane);
-    try {
-        // return await: without it, the finally below releases the semaphore
-        // slot the moment solveOnce() is *invoked*, not when it settles.
-        return await solveOnce(siteUrl, siteKey, timeout, action, cData, startLane, false);
-    } finally {
-        releaseSlot(startLane);
-    }
-}
-
-async function solveOnce(siteUrl, siteKey, timeout, action, cData, lane, escalated) {
     let target = siteUrl.trim();
     if (!target.endsWith('/')) target += '/';
     const t0 = Date.now();
-    let ctx;
-    try {
-        ctx = await grabCtx(lane);
-    } catch (e) {
-        return { success: false, err: e.message, lane };
-    }
-    let pg;
-    try {
-        pg = await ctx.newPage();
-    } catch {
-        // A pooled context died with the browser; discard it and take another.
-        await ctx.close().catch(() => {});
-        ctx = await grabCtx(lane);
-        pg = await ctx.newPage();
-    }
+    const ctx = await grabCtx();
+    const pg = await ctx.newPage();
     let clicked = false;
-
-    pg.on('close', () => console.log(`[WARN] ${lane} page closed at ${Date.now() - t0}ms into solve`));
-    pg.on('crash', () => console.log(`[WARN] ${lane} page CRASHED at ${Date.now() - t0}ms into solve`));
 
     try {
         const html = buildPage(siteKey, action, cData);
         await pg.route(target, r => r.fulfill({ body: html, status: 200, contentType: 'text/html' }));
         await pg.goto(target, { waitUntil: 'domcontentloaded', timeout: 15000 });
-        // Bring the tab to the front: pooled contexts mean several windows
-        // on the display, and an occluded window freezes rendering, which
-        // stalls detection until the challenge gives up and closes the tab.
-        await pg.bringToFront().catch(() => {});
 
-        // Event-driven detection: the predicate is evaluated inside the page
-        // on every animation frame (no CDP round-trip per poll, no fixed
-        // 150ms sleep), so the token is picked up the moment it lands.
-        const deadline = Date.now() + timeout * 1000;
-        while (Date.now() < deadline) {
-            const state = await pg.waitForFunction(() => {
-                const tok = document.querySelector('[name=cf-turnstile-response]')?.value;
-                // >= 20 chars: Cloudflare's official test keys return
-                // "XXXX.DUMMY.TOKEN.XXXX" (exactly 20) — the old >30 check
-                // could never pass them.
-                if (tok && tok.length >= 20) return { kind: 'token', tok };
-                if (window.__ci && !window.__clicked) return { kind: 'interactive' };
-                return false;
-            }, [], { timeout: deadline - Date.now(), polling: 100 })
-                .then(h => h.jsonValue())
-                .catch(e => {
-                    console.log('[WARN] waitForFunction failed:', String(e && e.message || e).slice(0, 200));
-                    return null;
-                });
+        while (Date.now() - t0 < timeout * 1000) {
+            const [tok, ci] = await pg.evaluate(`[
+                document.querySelector('[name=cf-turnstile-response]')?.value || null,
+                window.__ci || 0
+            ]`);
 
-            if (!state) break; // overall timeout
-
-            if (state.kind === 'token') {
+            if (tok && tok.length > 30) {
                 const elapsed = Math.round((Date.now() - t0) / 10) / 100;
-                return { success: true, token: state.tok, time: elapsed, interactive: clicked, lane, escalated };
+                return { success: true, token: tok, time: elapsed };
             }
 
-            if (state.kind === 'interactive') {
-                // Interactive challenges cannot be passed headless (verified
-                // against plain Playwright and rebrowser-patched drivers): in
-                // hybrid mode, bail out immediately and escalate.
-                if (lane === 'headless' && MODE === 'hybrid') {
-                    // Cleanup happens in the finally block below — dropping
-                    // the context here as well would double-release it into
-                    // the pool and the finally's drop would CLOSE the live
-                    // context still listed there, poisoning the pool.
-                    return { __escalate: true };
-                }
-                if (!clicked) {
-                    clicked = true;
-                    console.log(`[INFO] Interactive challenge detected on ${lane} lane, dispatching click...`);
-                    await pg.evaluate(() => { window.__clicked = true; }).catch(() => {});
+            if (ci && !clicked) {
+                clicked = true;
                 await new Promise(r => setTimeout(r, 400));
                 try {
                     const cfFrame = pg.frames().find(f => f.url().includes('challenges.cloudflare.com'));
@@ -697,16 +510,17 @@ async function solveOnce(siteUrl, siteKey, timeout, action, cData, lane, escalat
                         await pg.mouse.up();
                     }
                 } catch {}
-                }
             }
+
+            await new Promise(r => setTimeout(r, 150));
         }
 
-        return { success: false, err: 'timeout', lane, escalated };
+        return { success: false, err: 'timeout' };
     } catch (e) {
-        return { success: false, err: e.message, lane, escalated };
+        return { success: false, err: e.message };
     } finally {
         await pg.close().catch(() => {});
-        await dropCtx(ctx, lane);
+        await dropCtx(ctx);
     }
 }
 
@@ -725,20 +539,31 @@ app.get('/solve', async (req, res) => {
     }
 });
 
-app.get('/health', (req, res) => res.json({
-    ok: true,
-    mode: MODE,
-    pool_headless: pools.headless.length,
-    pool_headful: pools.headful.length,
-    interactive_sites: interactiveSites.size,
-}));
+app.get('/health', (req, res) => res.json({ ok: true, pool: ctxPool.length }));
 
 async function main() {
-    const startLane = (MODE === 'headful') ? 'headful' : 'headless';
-    await ensureBrowser(startLane);
+    const exePath = findPatchrightExe();
+    if (exePath) {
+        console.log(`[INFO] Using Chromium binary: ${exePath}`);
+    } else {
+        console.log(`[WARN] Patchright/custom Chromium not found, falling back to default Playwright browser`);
+    }
 
-    console.log(`[INFO] Mode: ${MODE} — ${startLane} browser ready. ` +
-        (MODE === 'hybrid' ? 'Headful lane launches on demand (needs a display).' : ''));
+    browser = await chromium.launch({
+        executablePath: exePath || undefined,
+        headless: HEADLESS,
+        args: [
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled',
+            '--no-first-run'
+        ]
+    });
+
+    console.log(`[INFO] Browser launched (headless: ${HEADLESS}). Initializing pool of ${POOL_SIZE} contexts...`);
+    for (let i = 0; i < POOL_SIZE; i++) {
+        ctxPool.push(await browser.newContext({ viewport: { width: 1280, height: 720 } }));
+    }
 
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`[INFO] Server running at http://0.0.0.0:${PORT}`);
