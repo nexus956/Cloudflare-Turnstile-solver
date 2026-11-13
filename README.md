@@ -1,260 +1,224 @@
 # Cloudflare Turnstile Solver
 
-A fast, high-performance automated Cloudflare Turnstile token resolver built with Playwright and Express. Designed for local development and headless Linux / Ubuntu CLI servers.
+Fast, high-performance automated Cloudflare Turnstile token resolver built with Playwright and Express. Runs as a long-lived service: pre-warmed browser pools, hybrid headless/headful lanes, a bounded request queue, automatic crash recovery, and an optional always-ready token buffer.
+
+**Verified performance** (8-vCPU VPS, live Cloudflare):
+
+| Load | Result |
+|---|---|
+| 1 solve | ~4s |
+| 50 simultaneous | 50/50 tokens in ~50s (~1 token/s) |
+| 100 simultaneous | 100/100 in ~101s |
+| 1000 simultaneous | 999/1000 in ~18 min |
+| Non-interactive challenges | 4.4 tokens/s (headless lane) |
+| Token from buffer | ~2 milliseconds |
 
 ---
 
-## Features
+## How it works — the workflow
 
-- **Sub-2-second token resolution**: Uses target origin route interception to avoid downloading bloat from the target website.
-- **Automated interactive challenge detection**: Listens for Cloudflare's `interactiveBegin` event and dispatches human-modeled mouse clicks.
-- **Pre-warmed browser context pooling**: High throughput with reusable browser contexts and automatic cookie cleanup.
-- **Headless & Headful with Xvfb**: Works seamlessly on headless Ubuntu CLI servers via `xvfb-run` without GUI/display popups.
-- **Dual Interface**: Includes an embedded web UI dashboard and REST API endpoint.
-- **PM2 Ready**: Includes `ecosystem.config.js` for 24/7 background service management.
+```
+                       ┌────────────────────────────┐
+ request ──► /solve ───►│  queue (per-lane limits)   │
+                       └───────────┬────────────────┘
+                                   │
+              ┌────────────────────┴────────────────────┐
+              ▼                                         ▼
+     ┌── headless lane ──┐                    ┌── headful lane ──┐
+     │ cheap, no display │   interactive?     │ Xvfb display,    │
+     │ ~2s/solve         │ ── challenge ────► │ real click,      │
+     │ limit 20          │    detected        │ ~4s/solve        │
+     └───────────────────┘                    │ limit 10         │
+                                              └────────┬─────────┘
+                    ┌──────────────────────────────────┘
+                    ▼
+              token in response JSON
+```
+
+1. Every request enters a **queue** (per-lane concurrency limits) — bursts never
+   melt the browser; they wait in line and are served at the machine's full speed.
+2. Requests start on the **headless lane**. Non-interactive challenges (most
+   sites) are solved there in ~2s.
+3. If a challenge turns **interactive** (a click is required), the attempt is
+   aborted instantly and **escalated** to the headful lane, which solves it
+   100%. The sitekey is remembered — later solves for that site go straight to
+   the headful lane.
+4. Contexts keep their **cookies between solves**, so repeat solves look like
+   returning visitors and run at warm speed (~4s vs 13s cold).
+5. If the browser process dies (OOM, GPU abort), the next solve **relaunches
+   it and rebuilds the pool automatically** — the service never stays down.
+6. Tokens are **single-use** and expire after ~5 minutes. Solve → use quickly,
+   or keep them in the token buffer (below) and use within the window.
+
+**Why the queue exists:** 8 CPU cores render ~10 interactive challenges at
+once at full speed. More simultaneous pages = every solve stretches (15 → 20
+pages) or collapses (50 pages: 86% success, 21GB RAM — measured). The queue
+converts a flood into a steady, reliable stream instead of a meltdown.
 
 ---
 
-## Getting Started
+## Install & run
 
-### 1. Install Dependencies
 ```bash
 npm install
 npx playwright install chromium
-npx playwright install-deps
-```
 
-### 2. Start the Solver Server
-
-```bash
-# Standard launch:
-npm start
-
-# Or with virtual display (headless Linux servers, no desktop popups):
+# headful (needed for interactive challenges): run inside Xvfb
 npm run start:xvfb
-
-# Or directly:
-./start.sh
+# headless-only (non-interactive sites, no display needed):
+npm start
 ```
 
----
+### Production (PM2)
 
-## Configuration
-
-You can configure the server via **CLI Flags**, **Environment Variables**, or **ecosystem.config.js**:
-
-### 1. CLI Flags
 ```bash
-node Turnstile_Solver.js --pool 10 --port 6767
-./start.sh --pool 10
+pm2 start ecosystem.config.js && pm2 save && pm2 startup
 ```
 
-### 2. Environment Variables
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `PORT` | `6767` | Port for the Express server to listen on |
-| `POOL_SIZE` | `5` | Number of pre-warmed browser contexts in memory |
-| `HEADLESS` | `false` | Set to `true` to force headless mode (default: false / headless OFF) |
+`ecosystem.config.js` reference:
 
-### 3. PM2 Ecosystem File
-Edit `POOL_SIZE` or `PORT` directly in `ecosystem.config.js`.
-
----
-
-## API Usage
-
-### Endpoint: `GET /solve`
-
-**Parameters:**
-- `url` (required): The target URL where the Turnstile challenge is used.
-- `sitekey` (required): The Cloudflare Turnstile site key (`0x4AAAAAA...`).
-- `timeout` (optional): Maximum seconds to wait (default: `30`).
-
-**Example Request:**
-```bash
-curl -s "http://localhost:6767/solve?url=https://dashboard.proxyscrape.com/v2/login&sitekey=0x4AAAAAAAFWUVCKyusT9T8r"
-```
-
-**Example Response:**
-```json
-{
-  "success": true,
-  "token": "1.R7ndzAHG4U-ldkPbQYX7ppOv-g97N0iIy-hhA3YrQz8z1jPlJGI_ufjaUZeQfBNQ2AmKDvkzsYMvmk2GryHqsUPhRP812ggR464A2m28NAylYducdXtEa_G9d2oUnd2ksoCz8htS0pn6DpV04RZ5ywNV3EfBfI_2NUI9sYrmxOuBiu4Fs1olW9eX_p_caYZb_Ro9Z87rq535HAzuhG3y3OEdK0zg1iMcCRcMTMR5nUmzZuHxrz4llg3e5xhiqlRZuSqKw5Bti7JUU3YQw0RF3dpI6c7yBDf0LB_ZiAs3k24LvE-ijftvBG7PHRclPESvhEaDG7yLIQR2TshD2ChEwvjgemmGHcLft1Jkk-HLKsTTZpi1aQSgzUxh6-ryrnSEeUvXI7YVzOSsht4jvfJZNL1hYYY7GkHbensALi1EFvzJQ-Tf3mzv0os8cR2AD_ujI0i6WmFGfnwux54V1qqSCjJtZuOYnLtdKTW-xqaVYTdGSuyJCGR6LAJjp--bfGmHgF-U1w43Osd1vT5wRV4WheFwIMb-r4d2SJrCBzOnSFxNTvCzXUH-vIGMOhwxQj0tUm9AtD--nh6zdJvTlaw-uxy4-vxN0KCVr92fY-7eRf4nrBC5XFixNlYGVGwntl9k.k8aaAUNUMP0sdZnlom6OEw.eb6899a49bd7ac8a6cb04870efe0d46c7ef06cf9dd68bfb7a6df08928408cbd3",
-  "time": 1.82
+```js
+env: {
+  NODE_ENV: 'production',
+  PORT: 6767,
+  MODE: 'hybrid',              // headless | headful | hybrid
+  POOL_SIZE: 50,              // warm contexts per lane
+  MAX_CONCURRENT_HEADLESS: 20, // non-interactive lane limit
+  MAX_CONCURRENT_HEADFUL: 10   // interactive lane limit (10 = 8-vCPU optimum)
 }
 ```
 
-### Healthcheck: `GET /health`
-```bash
-curl -s http://localhost:6767/health
-```
+---
+
+## Configuration reference
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--mode` | `MODE` | `hybrid` | `headless` (cheap, no display), `headful` (Xvfb, solves interactive), `hybrid` (headless-first, auto-escalate) |
+| `--pool` | `POOL_SIZE` | 5 | Warm contexts per lane. Sensible: 2–3× the concurrency limit. Bigger = warm identity inventory, not speed. |
+| `--max-concurrent-headless` | `MAX_CONCURRENT_HEADLESS` | 20 | Non-interactive lane queue limit |
+| `--max-concurrent-headful` | `MAX_CONCURRENT_HEADFUL` | `MAX_CONCURRENT` (3) | Interactive lane queue limit. **10 on 8 vCPU; keep low on small boxes** |
+| `--timeout` | `TIMEOUT` | 45 | Solve deadline seconds. 45 lets Cloudflare's rare heavy-challenge variant finish instead of dying as `timeout` |
+| `--port` | `PORT` | 6767 | API port |
+| `--clear-cookies` | `CLEAR_COOKIES` | false | Wipe cookies after every solve (strict isolation) instead of keeping warm identities |
+| `--headless` | `HEADLESS` | false | Legacy: `true` → headless mode |
+
+---
+
+## API
+
+### `GET /solve?url=<site>&sitekey=<key>[&action=..&cdata=..&timeout=..]`
+
 ```json
-{"ok": true, "pool": 5}
+{
+  "success": true,
+  "token": "1.ABCD...",
+  "time": 3.42,
+  "interactive": true,
+  "lane": "headful",
+  "escalated": true
+}
 ```
+
+### `GET /health`
+
+```json
+{"ok":true,"mode":"hybrid","pool_headless":50,"pool_headful":49,"interactive_sites":1}
+```
+
+Official test keys (`1x00000000000000000000AA` always passes) work — use one
+solve against a test key as a **meaningful health check** (~2s).
 
 ---
 
-## Ubuntu Server Deployment (CLI / No GUI)
+## How to use it according to your load
 
-On a headless Ubuntu Server without a physical monitor or desktop:
+| Your pattern | Do this | Expect |
+|---|---|---|
+| **Occasional single token** | `GET /solve` on demand | ~4s per token |
+| **Steady trickle** (one every few seconds) | Just call `/solve` each time | each ~4s, never queues |
+| **Need tokens instantly** (no 4s wait) | Run the **token buffer** (below); grab from it | **~2ms** per token |
+| **Bursts of 10–50** | Fire them all at once — the queue handles it | ~1 token/s; all succeed; first tokens in ~10s |
+| **Massive floods (hundreds+)** | Fire away — queue absorbs everything | ~1 token/s sustained, ~100% accuracy |
+| **Mostly non-interactive sites** | Nothing to change; hybrid sends them to the headless lane | 4.4 tokens/s |
+| **Real-time app, latency critical** | Buffer + keep `MAX_CONCURRENT_HEADFUL` low (4–8) | each solve stays near solo speed |
+
+**Hardware sizing** (interactive challenges, measured):
+
+| vCPU | `MAX_CONCURRENT_HEADFUL` | Throughput |
+|---|---|---|
+| 4 | 3–5 | ~0.5/s |
+| 8 | **10** | ~0.9/s (12+ collapses — measured) |
+| 16 | ~15 (validate first) | ~1.5/s |
+
+Do not raise limits above what the CPU can render: every extra simultaneous
+page stretches *all* solves and eventually kills them. The queue is the
+protection; the pool is not a speed dial.
+
+---
+
+## Token buffer — instant tokens (`token_buffer.py`)
+
+Solves tokens in the background and keeps a rolling stock of fresh ones.
 
 ```bash
-# 1. Install Xvfb and Playwright dependencies
-sudo apt-get update && sudo apt-get install -y xvfb
-npx playwright install chromium
-npx playwright install-deps
-
-# 2. Install PM2
-sudo npm install -g pm2
-
-# 3. Start the service
-pm2 start ecosystem.config.js
-
-# 4. Enable auto-restart on reboot
-pm2 startup
-pm2 save
+pm2 start token_buffer.py --name token-buffer --interpreter python3 -- 10 6768 "https://site/login/" "0x4AAAA..."
+#            args:                                          │   │      └ target URL   └ sitekey
+#                                              buffer size ┘   └ port
 ```
 
-**PM2 Management Commands:**
-```bash
-pm2 logs turnstile-solver    # View real-time logs
-pm2 status                  # Check process status
-pm2 restart ecosystem.config.js # Restart service
-pm2 stop turnstile-solver    # Stop service
-```
+- `GET :6768/token` → `{ "token": "...", "age_s": 12, "buffer_left": 9 }` — **instant** (~2ms)
+- `GET :6768/buffer` → stock count + ages
+- `GET :6768/health` → solved/served/failed stats
 
----
+Tokens expire (~5 min), so size the buffer to your burst size, not bigger —
+an oversized buffer solves tokens that die unused. 10 is a good default;
+use 50 only if you regularly grab 50 at once.
 
-## Full Flow: Harvest → Solve → Submit (`solve-flow.sh`)
-
-The `/solve` API requires a sitekey, and a solved token only matters once it is
-POSTed back to the target. Sites that use Turnstile sit behind Cloudflare, so
-the page fetch before the solve and the form submit after it both need a
-fingerprinted HTTP client — a plain `curl`/`requests` gets 403'd or
-challenge-walled before the sitekey is ever visible.
-
-`solve-flow.sh` chains the whole thing around the running solver API:
-
-```
-1. HARVEST  fetch the target page with a real browser TLS/HTTP2 fingerprint
-            (tlsreq, Chrome 154) and extract the Turnstile sitekey
-2. SOLVE    call this solver's /solve endpoint for a token
-3. SUBMIT   POST the token to the target form on the same fingerprinted session
-```
-
-Requires `tlsreq` on PATH and the solver API running (default
-`http://127.0.0.1:6767`).
+## Live console view (`live_tokens.py`)
 
 ```bash
-# Just harvest + solve, print the token
-./solve-flow.sh https://target.com/login
-
-# Harvest → solve → submit with extra form fields and a clearance cookie
-./solve-flow.sh https://target.com/login \
-    --submit https://target.com/login \
-    --data "username=me" --data "password=..." \
-    --cookie "cf_clearance=..."
-
-# Options
-#   --submit URL      endpoint to POST the token to (prints token if omitted)
-#   --field NAME      token form field (default: cf-turnstile-response)
-#   --action/--cdata   forwarded to the solver
-#   --profile P       tlsreq browser profile (default: chrome_154)
-#   --solver URL      solver API base URL
-#   --cookie k=v      cookie passed to harvest and submit (repeatable)
-#   --data k=v        extra form fields for submit (repeatable)
-#   --timeout N       solver timeout seconds
+python3 live_tokens.py 50                      # watch 50 solves land one-by-one
+python3 live_tokens.py 10 <url> <sitekey>      # any target
 ```
 
-If the harvested page looks like a Cloudflare challenge instead of the real
-page, the script warns and suggests solving the clearance first (see
-[cloudflare-invisible-solver](https://github.com/nexus956/cloudflare-invisible-solver))
-and passing `--cookie "cf_clearance=..."`.
+## Harvest → solve → submit (`solve-flow.sh`)
+
+For a target site you don't know the sitekey of: fetches the page with a
+fingerprinted HTTP client (requires `tlsreq`), extracts the sitekey, solves,
+and optionally submits the token. See `solve-flow.sh --help`.
 
 ---
 
-## Performance & Reliability (solver core)
+## Reliability & self-healing
 
-- **~3s warm solves** on interactive challenges (was a fixed 150ms CDP poll
-  loop; token detection now polls inside the page every 100ms with no
-  round-trip, and the tab is brought to front first).
-- **Official test keys work**: Cloudflare's dummy token
-  (`XXXX.DUMMY.TOKEN.XXXX`, 20 chars) previously failed the `>30` length
-  check — the threshold is now `>= 20`.
-- **Cookie retention (default)**: pooled contexts keep their
-  `challenges.cloudflare.com` cookies between solves, so repeat solves skip
-  straight past the interactive step. Use `--clear-cookies` / `CLEAR_COOKIES=true`
-  to restore per-solve isolation.
-- **Crash recovery**: if the browser process dies (OOM, GPU abort), the next
-  solve relaunches it and rebuilds the pool automatically — the service no
-  longer returns 500s until a manual restart.
-- `--disable-gpu` is passed to Chromium: under Xvfb there is no real GLX, and
-  without it the GPU process can take the whole browser down mid-challenge.
+- **Browser crash** → next solve relaunches the browser and rebuilds the pool. One shared in-flight launch per lane (concurrent escalations can't spawn duplicate browsers).
+- **Dead pooled context** → discarded automatically, a fresh one is taken.
+- **Timeouts** → returned as `{"success":false,"err":"timeout"}` — retry; the rare heavy-challenge variant is why the default deadline is 45s.
+- Escalation releases its headless slot before taking a headful slot — exactly one slot per request at any time.
 
-### Troubleshooting: page closes ~1-2s into every solve
+## Monitoring
 
-The renderer aborts on first text draw when the container has **no fonts**:
-logs show `SkFontMgr ... Not implemented` or repeated `TextRunHarfBuzz`
-errors. Install `fontconfig` + `fonts-dejavu-core` (or run
-`npx playwright install-deps`), or point `FONTCONFIG_FILE` at a config that
-lists your font directory. Symptom without it: solves fail with
-`Target page, context or browser has been closed` within two seconds.
+```bash
+curl -s localhost:6767/health                      # pools, mode, learned sitekeys
+curl -s "localhost:6767/solve?url=x&sitekey=1x00000000000000000000AA"   # ~2s health probe
+pm2 logs turnstile-solver
+```
 
----
+## Troubleshooting
 
-## Hybrid mode (default): headless-first with on-demand escalation
+- **`Target page, context or browser has been closed` ~1–2s into every solve** — missing fonts (containers): install `fontconfig` + `fonts-dejavu-core` or run `npx playwright install-deps`, or point `FONTCONFIG_FILE` at a config listing your font dir.
+- **Interactive challenges time out in pure headless** — expected; headless cannot pass them (verified against plain Playwright and rebrowser-patched drivers). Use hybrid/headful with Xvfb.
+- **GPU aborts under Xvfb** — the launch args already include `--disable-gpu`; keep it.
+- **Solves stretch to 15–20s+** — concurrency limit above the CPU's capacity; lower `MAX_CONCURRENT_HEADFUL`.
+- **50 simultaneous requests → slow / failures** — never disable the queue; the no-queue result is 86% @ 21GB (measured).
+- **First solve after restart ~6s** — the escalation learning step; subsequent solves for that site go direct.
 
-Cloudflare's **interactive** challenges cannot be solved headless — verified
-against plain Playwright *and* rebrowser-patched drivers (rebrowser 1.64 +
-Chrome 156): the widget presents the challenge, the click is dispatched, and
-no token is ever issued. Non-interactive (managed) challenges and the official
-test keys pass headless in ~1.9s.
+## Measured limits (8 vCPU, 32GB, live Cloudflare)
 
-So the solver now runs in **hybrid** mode by default:
+- Interactive throughput ceiling: **~0.9 tokens/s** (CPU-bound; RAM/pool irrelevant — pool 50 and pool 1000 measured identical)
+- Non-interactive: **4.4 tokens/s** at headless limit 20
+- Both lanes at once contend for the same CPU: batch by challenge type for best totals
+- Unqueued 50-wide: 43/50, 69s each, 21.6GB — the anti-pattern
 
-1. Every solve starts on the **headless lane** — fast, no display needed.
-2. The moment a challenge turns interactive, the attempt is aborted and the
-   solve is **escalated to the headful lane** (Xvfb), which passes it 100%.
-3. The sitekey is remembered — subsequent solves for that site go **straight
-   to headful**, no wasted headless attempt.
-4. The headful browser launches **lazily** on first escalation. If your
-   targets never serve interactive challenges, the headful lane (and its RAM)
-   never exists.
-
-Modes: `--mode headless | headful | hybrid` (env `MODE`, default `hybrid`).
-
-**RAM (measured, POOL_SIZE=5):**
-
-| State | Chromium RSS |
-|---|---|
-| Hybrid idle / non-interactive targets (headless lane only) | **~520 MB** |
-| After first escalation (headful lane spawned) | ~1.2 GB |
-
-That is the "less RAM, faster" answer for headless-capable targets: half the
-memory of an always-headful setup, ~1.9s solves, and full interactive
-capability kept in reserve. `/health` reports both pool sizes and the number
-of interactive sitekeys learned.
-
-**Note for deployments without a display:** the headless lane works with no
-Xvfb at all; only the escalation lane needs one (`npm run start:xvfb`).
-
----
-
-## Concurrency & queueing
-
-Solve limits are **per lane** (requests beyond the limit **queue** and are
-served in waves):
-
-- `--max-concurrent-headless` (env `MAX_CONCURRENT_HEADLESS`, default **20**)
-  — the headless lane (non-interactive challenges). Pages are ~5x lighter;
-  measured 4.4 tokens/s at 20 concurrent on an 8-vCPU box.
-- `--max-concurrent-headful` (env `MAX_CONCURRENT_HEADFUL`, default
-  `MAX_CONCURRENT`, itself default **3**) — the headful lane (interactive
-  challenges). CPU-bound: measured peak is 10 on 8 vCPU (15 and 20 are
-  slower AND less accurate); keep it low on small boxes.
-
-Do not raise limits without validating on your hardware. Above the box's real
-capacity, every solve stretches and pages start dying. The queue exists so a
-request burst degrades into a line — not a meltdown (measured: 50
-simultaneous unqueued → 86% success, 21GB RAM; queued at the right limit →
-100%, 2GB, and *faster overall*).
+License: MIT. Built on Playwright. See `solve-flow.sh` for fingerprinted transport via [tlsreq](https://github.com/nexus956/tlsreq).
