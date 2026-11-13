@@ -10,7 +10,7 @@ module.exports = {
       restart_delay: 2000,
       env: {
         NODE_ENV: "production",
-        PORT: 6767,
+        PORT: 6969,
         POOL_SIZE: 50,
         MAX_CONCURRENT_HEADFUL: 10,
         MAX_CONCURRENT_HEADLESS: 20
