@@ -16,7 +16,7 @@ function getArg(flags, envVal, defaultVal) {
 
 const PORT = parseInt(getArg(['--port', '-P'], process.env.PORT, '6767'), 10);
 const POOL_SIZE = parseInt(getArg(['--pool', '-p'], process.env.POOL_SIZE, '5'), 10);
-const TIMEOUT = 30;
+const TIMEOUT = 45;
 // Concurrent solve limits per lane: requests beyond the limit QUEUE instead
 // of all landing on the browser at once.
 // - headful (interactive challenges): CPU-bound, peaks at 10 on 8 vCPU
