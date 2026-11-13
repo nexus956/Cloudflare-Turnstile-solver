@@ -18,6 +18,7 @@ const PORT = parseInt(getArg(['--port', '-P'], process.env.PORT, '6767'), 10);
 const POOL_SIZE = parseInt(getArg(['--pool', '-p'], process.env.POOL_SIZE, '5'), 10);
 const TIMEOUT = 30;
 const HEADLESS = getArg('--headless', process.env.HEADLESS, 'false') === 'true';
+const CLEAR_COOKIES = getArg('--clear-cookies', process.env.CLEAR_COOKIES, 'false') === 'true';
 
 const HTML_UI = `<!DOCTYPE html>
 <html lang="en">
@@ -409,23 +410,6 @@ function buildPage(siteKey, action, cData) {
 </html>`;
 }
 
-let browser;
-const ctxPool = [];
-
-async function grabCtx() {
-    if (ctxPool.length > 0) return ctxPool.shift();
-    return await browser.newContext({ viewport: { width: 1280, height: 720 } });
-}
-
-async function dropCtx(ctx) {
-    if (ctxPool.length < POOL_SIZE) {
-        await ctx.clearCookies().catch(() => {});
-        ctxPool.push(ctx);
-    } else {
-        await ctx.close().catch(() => {});
-    }
-}
-
 function findPatchrightExe() {
     for (const py of ['python3', 'python']) {
         try {
@@ -458,32 +442,126 @@ function findPatchrightExe() {
     return null;
 }
 
+async function launchBrowser() {
+    const exePath = findPatchrightExe();
+    if (exePath) {
+        console.log(`[INFO] Using Chromium binary: ${exePath}`);
+    } else {
+        console.log(`[WARN] Patchright/custom Chromium not found, falling back to default Playwright browser`);
+    }
+
+    return await chromium.launch({
+        executablePath: exePath || undefined,
+        headless: HEADLESS,
+        args: [
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled',
+            '--no-first-run',
+            // Software GL: without this the GPU process can crash under Xvfb
+            // (no real GLX), and Turnstile's interactive challenge takes the
+            // whole browser down with it. WebGL still works via SwiftShader.
+            '--disable-gpu'
+        ]
+    });
+}
+
+let browser;
+const ctxPool = [];
+
+// Relaunch the browser and rebuild the pool when the process has died (OOM,
+// GPU abort, font crash): a single crash used to leave dead contexts in the
+// pool and the service returning 500s until a manual restart.
+async function ensureBrowser() {
+    if (browser && browser.isConnected()) return;
+    console.log('[INFO] Browser down, relaunching and rebuilding pool...');
+    await browser?.close().catch(() => {});
+    browser = await launchBrowser();
+    ctxPool.length = 0;
+    for (let i = 0; i < POOL_SIZE; i++) {
+        ctxPool.push(await browser.newContext({ viewport: { width: 1280, height: 720 } }));
+    }
+    console.log(`[INFO] Browser relaunched, pool rebuilt (${POOL_SIZE} contexts)`);
+}
+
+async function grabCtx() {
+    if (ctxPool.length > 0) return ctxPool.shift();
+    await ensureBrowser();
+    return await browser.newContext({ viewport: { width: 1280, height: 720 } });
+}
+
+// By default contexts keep their cookies between solves: warm
+// challenges.cloudflare.com cookies make repeat solves faster (often skipping
+// the interactive step). Pass --clear-cookies for the old isolation behavior.
+async function dropCtx(ctx) {
+    if (ctxPool.length < POOL_SIZE) {
+        if (CLEAR_COOKIES) await ctx.clearCookies().catch(() => {});
+        ctxPool.push(ctx);
+    } else {
+        await ctx.close().catch(() => {});
+    }
+}
+
 async function solve(siteUrl, siteKey, timeout = TIMEOUT, action, cData) {
     let target = siteUrl.trim();
     if (!target.endsWith('/')) target += '/';
     const t0 = Date.now();
-    const ctx = await grabCtx();
-    const pg = await ctx.newPage();
+    await ensureBrowser();
+    let ctx = await grabCtx();
+    let pg;
+    try {
+        pg = await ctx.newPage();
+    } catch {
+        // A pooled context died with the browser; discard it and take another.
+        await ctx.close().catch(() => {});
+        ctx = await grabCtx();
+        pg = await ctx.newPage();
+    }
     let clicked = false;
+
+    pg.on('close', () => console.log(`[WARN] page closed at ${Date.now() - t0}ms into solve`));
+    pg.on('crash', () => console.log(`[WARN] page CRASHED at ${Date.now() - t0}ms into solve`));
 
     try {
         const html = buildPage(siteKey, action, cData);
         await pg.route(target, r => r.fulfill({ body: html, status: 200, contentType: 'text/html' }));
         await pg.goto(target, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        // Bring the tab to the front: pooled contexts mean several windows
+        // on the display, and an occluded window freezes rendering, which
+        // stalls detection until the challenge gives up and closes the tab.
+        await pg.bringToFront().catch(() => {});
 
-        while (Date.now() - t0 < timeout * 1000) {
-            const [tok, ci] = await pg.evaluate(`[
-                document.querySelector('[name=cf-turnstile-response]')?.value || null,
-                window.__ci || 0
-            ]`);
+        // Event-driven detection: the predicate is evaluated inside the page
+        // on every animation frame (no CDP round-trip per poll, no fixed
+        // 150ms sleep), so the token is picked up the moment it lands.
+        const deadline = Date.now() + timeout * 1000;
+        while (Date.now() < deadline) {
+            const state = await pg.waitForFunction(() => {
+                const tok = document.querySelector('[name=cf-turnstile-response]')?.value;
+                // >= 20 chars: Cloudflare's official test keys return
+                // "XXXX.DUMMY.TOKEN.XXXX" (exactly 20) — the old >30 check
+                // could never pass them.
+                if (tok && tok.length >= 20) return { kind: 'token', tok };
+                if (window.__ci && !window.__clicked) return { kind: 'interactive' };
+                return false;
+            }, [], { timeout: deadline - Date.now(), polling: 100 })
+                .then(h => h.jsonValue())
+                .catch(e => {
+                    console.log('[WARN] waitForFunction failed:', String(e && e.message || e).slice(0, 200));
+                    return null;
+                });
 
-            if (tok && tok.length > 30) {
+            if (!state) break; // overall timeout
+
+            if (state.kind === 'token') {
                 const elapsed = Math.round((Date.now() - t0) / 10) / 100;
-                return { success: true, token: tok, time: elapsed };
+                return { success: true, token: state.tok, time: elapsed, interactive: clicked };
             }
 
-            if (ci && !clicked) {
+            if (state.kind === 'interactive' && !clicked) {
                 clicked = true;
+                console.log('[INFO] Interactive challenge detected, dispatching click...');
+                await pg.evaluate(() => { window.__clicked = true; }).catch(() => {});
                 await new Promise(r => setTimeout(r, 400));
                 try {
                     const cfFrame = pg.frames().find(f => f.url().includes('challenges.cloudflare.com'));
@@ -511,8 +589,6 @@ async function solve(siteUrl, siteKey, timeout = TIMEOUT, action, cData) {
                     }
                 } catch {}
             }
-
-            await new Promise(r => setTimeout(r, 150));
         }
 
         return { success: false, err: 'timeout' };
@@ -542,23 +618,7 @@ app.get('/solve', async (req, res) => {
 app.get('/health', (req, res) => res.json({ ok: true, pool: ctxPool.length }));
 
 async function main() {
-    const exePath = findPatchrightExe();
-    if (exePath) {
-        console.log(`[INFO] Using Chromium binary: ${exePath}`);
-    } else {
-        console.log(`[WARN] Patchright/custom Chromium not found, falling back to default Playwright browser`);
-    }
-
-    browser = await chromium.launch({
-        executablePath: exePath || undefined,
-        headless: HEADLESS,
-        args: [
-            '--no-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-blink-features=AutomationControlled',
-            '--no-first-run'
-        ]
-    });
+    browser = await launchBrowser();
 
     console.log(`[INFO] Browser launched (headless: ${HEADLESS}). Initializing pool of ${POOL_SIZE} contexts...`);
     for (let i = 0; i < POOL_SIZE; i++) {

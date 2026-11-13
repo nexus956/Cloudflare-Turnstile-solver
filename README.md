@@ -170,3 +170,32 @@ If the harvested page looks like a Cloudflare challenge instead of the real
 page, the script warns and suggests solving the clearance first (see
 [cloudflare-invisible-solver](https://github.com/nexus956/cloudflare-invisible-solver))
 and passing `--cookie "cf_clearance=..."`.
+
+---
+
+## Performance & Reliability (solver core)
+
+- **~3s warm solves** on interactive challenges (was a fixed 150ms CDP poll
+  loop; token detection now polls inside the page every 100ms with no
+  round-trip, and the tab is brought to front first).
+- **Official test keys work**: Cloudflare's dummy token
+  (`XXXX.DUMMY.TOKEN.XXXX`, 20 chars) previously failed the `>30` length
+  check — the threshold is now `>= 20`.
+- **Cookie retention (default)**: pooled contexts keep their
+  `challenges.cloudflare.com` cookies between solves, so repeat solves skip
+  straight past the interactive step. Use `--clear-cookies` / `CLEAR_COOKIES=true`
+  to restore per-solve isolation.
+- **Crash recovery**: if the browser process dies (OOM, GPU abort), the next
+  solve relaunches it and rebuilds the pool automatically — the service no
+  longer returns 500s until a manual restart.
+- `--disable-gpu` is passed to Chromium: under Xvfb there is no real GLX, and
+  without it the GPU process can take the whole browser down mid-challenge.
+
+### Troubleshooting: page closes ~1-2s into every solve
+
+The renderer aborts on first text draw when the container has **no fonts**:
+logs show `SkFontMgr ... Not implemented` or repeated `TextRunHarfBuzz`
+errors. Install `fontconfig` + `fonts-dejavu-core` (or run
+`npx playwright install-deps`), or point `FONTCONFIG_FILE` at a config that
+lists your font directory. Symptom without it: solves fail with
+`Target page, context or browser has been closed` within two seconds.
