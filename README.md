@@ -182,13 +182,6 @@ python3 live_tokens.py 50                      # watch 50 solves land one-by-one
 python3 live_tokens.py 10 <url> <sitekey>      # any target
 ```
 
-## Harvest → solve → submit (`solve-flow.sh`)
-
-For a target site you don't know the sitekey of: fetches the page with a
-fingerprinted HTTP client (requires `tlsreq`), extracts the sitekey, solves,
-and optionally submits the token. See `solve-flow.sh --help`.
-
----
 
 ## Reliability & self-healing
 
@@ -221,4 +214,4 @@ pm2 logs turnstile-solver
 - Both lanes at once contend for the same CPU: batch by challenge type for best totals
 - Unqueued 50-wide: 43/50, 69s each, 21.6GB — the anti-pattern
 
-License: MIT. Built on Playwright. See `solve-flow.sh` for fingerprinted transport via [tlsreq](https://github.com/nexus956/tlsreq).
+License: MIT. Built on Playwright.
