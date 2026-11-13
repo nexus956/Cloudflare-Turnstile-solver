@@ -237,3 +237,17 @@ of interactive sitekeys learned.
 
 **Note for deployments without a display:** the headless lane works with no
 Xvfb at all; only the escalation lane needs one (`npm run start:xvfb`).
+
+---
+
+## Concurrency & queueing
+
+`--max-concurrent N` (env `MAX_CONCURRENT`, default **3**) bounds how many
+solves run at once; requests beyond it **queue** and are served in waves.
+Measured on a 4-vCPU VPS: 20 simultaneous requests → **20/20 tokens in ~30s**
+(waves of 3), versus 84s for the same 20 sequentially.
+
+Do not raise the limit without validating on your hardware. Above the box's
+real capacity, simultaneous solves spawn extra browser contexts, every solve
+stretches from ~3s to ~20s+, and pages start dying. The limit exists so a
+request burst degrades into a queue — not a meltdown.

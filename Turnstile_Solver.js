@@ -17,6 +17,26 @@ function getArg(flags, envVal, defaultVal) {
 const PORT = parseInt(getArg(['--port', '-P'], process.env.PORT, '6767'), 10);
 const POOL_SIZE = parseInt(getArg(['--pool', '-p'], process.env.POOL_SIZE, '5'), 10);
 const TIMEOUT = 30;
+// Concurrent solve limit: requests beyond this QUEUE instead of all landing
+// on the browser at once. Validated ceiling on a 4-vCPU VPS with software
+// GL: 3 concurrent interactive solves pass (3/3), 5 melts the browser
+// (17 relaunches, 3/20). Raise it on bigger machines.
+const MAX_CONCURRENT = parseInt(getArg(['--max-concurrent'], process.env.MAX_CONCURRENT, '3'), 10);
+let solving = 0;
+const waitQueue = [];
+
+function acquireSlot() {
+    return new Promise(resolve => {
+        if (solving < MAX_CONCURRENT) { solving++; resolve(); }
+        else waitQueue.push(resolve);
+    });
+}
+
+function releaseSlot() {
+    solving--;
+    const next = waitQueue.shift();
+    if (next) { solving++; next(); }
+}
 const HEADLESS = getArg('--headless', process.env.HEADLESS, 'false') === 'true';
 const CLEAR_COOKIES = getArg('--clear-cookies', process.env.CLEAR_COOKIES, 'false') === 'true';
 // MODE: headless | headful | hybrid (default). Hybrid solves on the cheap
@@ -484,23 +504,33 @@ const interactiveSites = new Set();
 // Relaunch a lane's browser and rebuild its pool when the process has died
 // (OOM, GPU abort, font crash): a single crash used to leave dead contexts
 // in the pool and the service returning 500s until a manual restart.
+// Concurrent callers share one in-flight launch — without this, N solves
+// escalating at once would each spawn their own browser.
+const ensureInFlight = {};
 async function ensureBrowser(lane) {
     if (browsers[lane] && browsers[lane].isConnected()) return;
-    console.log(`[INFO] ${lane} browser down, relaunching and rebuilding pool...`);
-    await browsers[lane]?.close().catch(() => {});
-    try {
-        browsers[lane] = await launchBrowser(lane === 'headless');
-    } catch (e) {
-        throw new Error(
-            `cannot launch ${lane} browser: ${e.message}` +
-            (lane === 'headful' ? ' (headful needs a display — run under Xvfb: npm run start:xvfb)' : '')
-        );
+    if (!ensureInFlight[lane]) {
+        ensureInFlight[lane] = (async () => {
+            console.log(`[INFO] ${lane} browser down, relaunching and rebuilding pool...`);
+            try {
+                await browsers[lane]?.close().catch(() => {});
+                browsers[lane] = await launchBrowser(lane === 'headless');
+                pools[lane].length = 0;
+                for (let i = 0; i < POOL_SIZE; i++) {
+                    pools[lane].push(await browsers[lane].newContext({ viewport: { width: 1280, height: 720 } }));
+                }
+                console.log(`[INFO] ${lane} browser relaunched, pool rebuilt (${POOL_SIZE} contexts)`);
+            } catch (e) {
+                throw new Error(
+                    `cannot launch ${lane} browser: ${e.message}` +
+                    (lane === 'headful' ? ' (headful needs a display — run under Xvfb: npm run start:xvfb)' : '')
+                );
+            } finally {
+                delete ensureInFlight[lane];
+            }
+        })();
     }
-    pools[lane].length = 0;
-    for (let i = 0; i < POOL_SIZE; i++) {
-        pools[lane].push(await browsers[lane].newContext({ viewport: { width: 1280, height: 720 } }));
-    }
-    console.log(`[INFO] ${lane} browser relaunched, pool rebuilt (${POOL_SIZE} contexts)`);
+    return ensureInFlight[lane];
 }
 
 async function grabCtx(lane) {
@@ -525,18 +555,26 @@ async function dropCtx(ctx, lane) {
 // headful go straight to headful; everything else starts on the cheap
 // headless lane and escalates on the first interactiveBegin.
 async function solve(siteUrl, siteKey, timeout = TIMEOUT, action, cData) {
-    const startLane = (MODE === 'headful' || interactiveSites.has(siteKey)) ? 'headful' : 'headless';
+    await acquireSlot();
+    try {
+        const startLane = (MODE === 'headful' || interactiveSites.has(siteKey)) ? 'headful' : 'headless';
 
-    if (startLane === 'headless' && MODE === 'hybrid') {
-        const first = await solveOnce(siteUrl, siteKey, timeout, action, cData, 'headless', false);
-        if (first.__escalate) {
-            interactiveSites.add(siteKey);
-            console.log(`[INFO] Interactive challenge needs the headful lane; ${siteKey} goes there directly from now on`);
-            return solveOnce(siteUrl, siteKey, timeout, action, cData, 'headful', true);
+        if (startLane === 'headless' && MODE === 'hybrid') {
+            const first = await solveOnce(siteUrl, siteKey, timeout, action, cData, 'headless', false);
+            if (first.__escalate) {
+                interactiveSites.add(siteKey);
+                console.log(`[INFO] Interactive challenge needs the headful lane; ${siteKey} goes there directly from now on`);
+                return await solveOnce(siteUrl, siteKey, timeout, action, cData, 'headful', true);
+            }
+            return first;
         }
-        return first;
+        // return await: without it, the finally below releases the semaphore
+        // slot the moment solveOnce() is *invoked*, not when it settles —
+        // every limit becomes a no-op and all requests run wild-concurrent.
+        return await solveOnce(siteUrl, siteKey, timeout, action, cData, startLane, false);
+    } finally {
+        releaseSlot();
     }
-    return solveOnce(siteUrl, siteKey, timeout, action, cData, startLane, false);
 }
 
 async function solveOnce(siteUrl, siteKey, timeout, action, cData, lane, escalated) {
@@ -604,8 +642,10 @@ async function solveOnce(siteUrl, siteKey, timeout, action, cData, lane, escalat
                 // against plain Playwright and rebrowser-patched drivers): in
                 // hybrid mode, bail out immediately and escalate.
                 if (lane === 'headless' && MODE === 'hybrid') {
-                    await pg.close().catch(() => {});
-                    await dropCtx(ctx, lane);
+                    // Cleanup happens in the finally block below — dropping
+                    // the context here as well would double-release it into
+                    // the pool and the finally's drop would CLOSE the live
+                    // context still listed there, poisoning the pool.
                     return { __escalate: true };
                 }
                 if (!clicked) {
