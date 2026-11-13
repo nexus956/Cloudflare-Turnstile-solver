@@ -199,3 +199,41 @@ errors. Install `fontconfig` + `fonts-dejavu-core` (or run
 `npx playwright install-deps`), or point `FONTCONFIG_FILE` at a config that
 lists your font directory. Symptom without it: solves fail with
 `Target page, context or browser has been closed` within two seconds.
+
+---
+
+## Hybrid mode (default): headless-first with on-demand escalation
+
+Cloudflare's **interactive** challenges cannot be solved headless — verified
+against plain Playwright *and* rebrowser-patched drivers (rebrowser 1.64 +
+Chrome 156): the widget presents the challenge, the click is dispatched, and
+no token is ever issued. Non-interactive (managed) challenges and the official
+test keys pass headless in ~1.9s.
+
+So the solver now runs in **hybrid** mode by default:
+
+1. Every solve starts on the **headless lane** — fast, no display needed.
+2. The moment a challenge turns interactive, the attempt is aborted and the
+   solve is **escalated to the headful lane** (Xvfb), which passes it 100%.
+3. The sitekey is remembered — subsequent solves for that site go **straight
+   to headful**, no wasted headless attempt.
+4. The headful browser launches **lazily** on first escalation. If your
+   targets never serve interactive challenges, the headful lane (and its RAM)
+   never exists.
+
+Modes: `--mode headless | headful | hybrid` (env `MODE`, default `hybrid`).
+
+**RAM (measured, POOL_SIZE=5):**
+
+| State | Chromium RSS |
+|---|---|
+| Hybrid idle / non-interactive targets (headless lane only) | **~520 MB** |
+| After first escalation (headful lane spawned) | ~1.2 GB |
+
+That is the "less RAM, faster" answer for headless-capable targets: half the
+memory of an always-headful setup, ~1.9s solves, and full interactive
+capability kept in reserve. `/health` reports both pool sizes and the number
+of interactive sitekeys learned.
+
+**Note for deployments without a display:** the headless lane works with no
+Xvfb at all; only the escalation lane needs one (`npm run start:xvfb`).
