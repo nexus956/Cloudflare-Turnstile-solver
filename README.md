@@ -1,6 +1,6 @@
 # Cloudflare Turnstile Solver
 
-Fast, high-performance automated Cloudflare Turnstile token resolver built with Playwright and Express. Runs as a long-lived service: pre-warmed browser pools, hybrid headless/headful lanes, a bounded request queue, automatic crash recovery, and an optional always-ready token buffer.
+Fast, high-performance automated Cloudflare Turnstile token resolver built with Playwright and Express. Runs as a long-lived service: pre-warmed browser pools, hybrid headless/headful lanes, a bounded request queue, and automatic crash recovery.
 
 **Verified performance** (8-vCPU VPS, live Cloudflare):
 
@@ -11,7 +11,6 @@ Fast, high-performance automated Cloudflare Turnstile token resolver built with 
 | 100 simultaneous | 100/100 in ~101s |
 | 1000 simultaneous | 999/1000 in ~18 min |
 | Non-interactive challenges | 4.4 tokens/s (headless lane) |
-| Token from buffer | ~2 milliseconds |
 
 ---
 
@@ -47,8 +46,7 @@ Fast, high-performance automated Cloudflare Turnstile token resolver built with 
    returning visitors and run at warm speed (~4s vs 13s cold).
 5. If the browser process dies (OOM, GPU abort), the next solve **relaunches
    it and rebuilds the pool automatically** — the service never stays down.
-6. Tokens are **single-use** and expire after ~5 minutes. Solve → use quickly,
-   or keep them in the token buffer (below) and use within the window.
+6. Tokens are **single-use** and expire after ~5 minutes. Solve → use quickly.
 
 **Why the queue exists:** 8 CPU cores render ~10 interactive challenges at
 once at full speed. More simultaneous pages = every solve stretches (15 → 20
@@ -137,11 +135,10 @@ solve against a test key as a **meaningful health check** (~2s).
 |---|---|---|
 | **Occasional single token** | `GET /solve` on demand | ~4s per token |
 | **Steady trickle** (one every few seconds) | Just call `/solve` each time | each ~4s, never queues |
-| **Need tokens instantly** (no 4s wait) | Run the **token buffer** (below); grab from it | **~2ms** per token |
 | **Bursts of 10–50** | Fire them all at once — the queue handles it | ~1 token/s; all succeed; first tokens in ~10s |
 | **Massive floods (hundreds+)** | Fire away — queue absorbs everything | ~1 token/s sustained, ~100% accuracy |
 | **Mostly non-interactive sites** | Nothing to change; hybrid sends them to the headless lane | 4.4 tokens/s |
-| **Real-time app, latency critical** | Buffer + keep `MAX_CONCURRENT_HEADFUL` low (4–8) | each solve stays near solo speed |
+| **Real-time app, latency critical** | Keep `MAX_CONCURRENT_HEADFUL` low (4–8) | each solve stays near solo speed |
 
 **Hardware sizing** (interactive challenges, measured):
 
@@ -157,30 +154,6 @@ protection; the pool is not a speed dial.
 
 ---
 
-## Token buffer — instant tokens (`token_buffer.py`)
-
-Solves tokens in the background and keeps a rolling stock of fresh ones.
-
-```bash
-pm2 start token_buffer.py --name token-buffer --interpreter python3 -- 10 6768 "https://site/login/" "0x4AAAA..."
-#            args:                                          │   │      └ target URL   └ sitekey
-#                                              buffer size ┘   └ port
-```
-
-- `GET :6768/token` → `{ "token": "...", "age_s": 12, "buffer_left": 9 }` — **instant** (~2ms)
-- `GET :6768/buffer` → stock count + ages
-- `GET :6768/health` → solved/served/failed stats
-
-Tokens expire (~5 min), so size the buffer to your burst size, not bigger —
-an oversized buffer solves tokens that die unused. 10 is a good default;
-use 50 only if you regularly grab 50 at once.
-
-## Live console view (`live_tokens.py`)
-
-```bash
-python3 live_tokens.py 50                      # watch 50 solves land one-by-one
-python3 live_tokens.py 10 <url> <sitekey>      # any target
-```
 
 
 ## Reliability & self-healing
