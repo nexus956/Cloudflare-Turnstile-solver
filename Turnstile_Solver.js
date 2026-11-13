@@ -17,25 +17,29 @@ function getArg(flags, envVal, defaultVal) {
 const PORT = parseInt(getArg(['--port', '-P'], process.env.PORT, '6767'), 10);
 const POOL_SIZE = parseInt(getArg(['--pool', '-p'], process.env.POOL_SIZE, '5'), 10);
 const TIMEOUT = 30;
-// Concurrent solve limit: requests beyond this QUEUE instead of all landing
-// on the browser at once. Validated ceiling on a 4-vCPU VPS with software
-// GL: 3 concurrent interactive solves pass (3/3), 5 melts the browser
-// (17 relaunches, 3/20). Raise it on bigger machines.
+// Concurrent solve limits per lane: requests beyond the limit QUEUE instead
+// of all landing on the browser at once.
+// - headful (interactive challenges): CPU-bound, peaks at 10 on 8 vCPU
+//   (measured: 15 and 20 are slower AND less accurate)
+// - headless (non-interactive challenges): pages are ~5x lighter, peaks at 20
 const MAX_CONCURRENT = parseInt(getArg(['--max-concurrent'], process.env.MAX_CONCURRENT, '3'), 10);
-let solving = 0;
-const waitQueue = [];
+const MAX_HEADLESS = parseInt(getArg(['--max-concurrent-headless'], process.env.MAX_CONCURRENT_HEADLESS, '20'), 10);
+const MAX_HEADFUL = parseInt(getArg(['--max-concurrent-headful'], process.env.MAX_CONCURRENT_HEADFUL, String(MAX_CONCURRENT)), 10);
+const LIMITS = { headless: MAX_HEADLESS, headful: MAX_HEADFUL };
+const solving = { headless: 0, headful: 0 };
+const waitQueue = { headless: [], headful: [] };
 
-function acquireSlot() {
+function acquireSlot(lane) {
     return new Promise(resolve => {
-        if (solving < MAX_CONCURRENT) { solving++; resolve(); }
-        else waitQueue.push(resolve);
+        if (solving[lane] < LIMITS[lane]) { solving[lane]++; resolve(); }
+        else waitQueue[lane].push(resolve);
     });
 }
 
-function releaseSlot() {
-    solving--;
-    const next = waitQueue.shift();
-    if (next) { solving++; next(); }
+function releaseSlot(lane) {
+    solving[lane]--;
+    const next = waitQueue[lane].shift();
+    if (next) { solving[lane]++; next(); }
 }
 const HEADLESS = getArg('--headless', process.env.HEADLESS, 'false') === 'true';
 const CLEAR_COOKIES = getArg('--clear-cookies', process.env.CLEAR_COOKIES, 'false') === 'true';
@@ -555,25 +559,40 @@ async function dropCtx(ctx, lane) {
 // headful go straight to headful; everything else starts on the cheap
 // headless lane and escalates on the first interactiveBegin.
 async function solve(siteUrl, siteKey, timeout = TIMEOUT, action, cData) {
-    await acquireSlot();
-    try {
-        const startLane = (MODE === 'headful' || interactiveSites.has(siteKey)) ? 'headful' : 'headless';
+    const startLane = (MODE === 'headful' || interactiveSites.has(siteKey)) ? 'headful' : 'headless';
 
-        if (startLane === 'headless' && MODE === 'hybrid') {
+    if (startLane === 'headless' && MODE === 'hybrid') {
+        await acquireSlot('headless');
+        let escalate = false;
+        try {
             const first = await solveOnce(siteUrl, siteKey, timeout, action, cData, 'headless', false);
             if (first.__escalate) {
-                interactiveSites.add(siteKey);
-                console.log(`[INFO] Interactive challenge needs the headful lane; ${siteKey} goes there directly from now on`);
-                return await solveOnce(siteUrl, siteKey, timeout, action, cData, 'headful', true);
+                escalate = true;
+            } else {
+                return first;
             }
-            return first;
+        } finally {
+            releaseSlot('headless');
         }
+        if (escalate) {
+            interactiveSites.add(siteKey);
+            console.log(`[INFO] Interactive challenge needs the headful lane; ${siteKey} goes there directly from now on`);
+            await acquireSlot('headful');
+            try {
+                return await solveOnce(siteUrl, siteKey, timeout, action, cData, 'headful', true);
+            } finally {
+                releaseSlot('headful');
+            }
+        }
+    }
+
+    await acquireSlot(startLane);
+    try {
         // return await: without it, the finally below releases the semaphore
-        // slot the moment solveOnce() is *invoked*, not when it settles —
-        // every limit becomes a no-op and all requests run wild-concurrent.
+        // slot the moment solveOnce() is *invoked*, not when it settles.
         return await solveOnce(siteUrl, siteKey, timeout, action, cData, startLane, false);
     } finally {
-        releaseSlot();
+        releaseSlot(startLane);
     }
 }
 
