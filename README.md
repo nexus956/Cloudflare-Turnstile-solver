@@ -122,3 +122,51 @@ pm2 status                  # Check process status
 pm2 restart ecosystem.config.js # Restart service
 pm2 stop turnstile-solver    # Stop service
 ```
+
+---
+
+## Full Flow: Harvest → Solve → Submit (`solve-flow.sh`)
+
+The `/solve` API requires a sitekey, and a solved token only matters once it is
+POSTed back to the target. Sites that use Turnstile sit behind Cloudflare, so
+the page fetch before the solve and the form submit after it both need a
+fingerprinted HTTP client — a plain `curl`/`requests` gets 403'd or
+challenge-walled before the sitekey is ever visible.
+
+`solve-flow.sh` chains the whole thing around the running solver API:
+
+```
+1. HARVEST  fetch the target page with a real browser TLS/HTTP2 fingerprint
+            (tlsreq, Chrome 154) and extract the Turnstile sitekey
+2. SOLVE    call this solver's /solve endpoint for a token
+3. SUBMIT   POST the token to the target form on the same fingerprinted session
+```
+
+Requires `tlsreq` on PATH and the solver API running (default
+`http://127.0.0.1:6767`).
+
+```bash
+# Just harvest + solve, print the token
+./solve-flow.sh https://target.com/login
+
+# Harvest → solve → submit with extra form fields and a clearance cookie
+./solve-flow.sh https://target.com/login \
+    --submit https://target.com/login \
+    --data "username=me" --data "password=..." \
+    --cookie "cf_clearance=..."
+
+# Options
+#   --submit URL      endpoint to POST the token to (prints token if omitted)
+#   --field NAME      token form field (default: cf-turnstile-response)
+#   --action/--cdata   forwarded to the solver
+#   --profile P       tlsreq browser profile (default: chrome_154)
+#   --solver URL      solver API base URL
+#   --cookie k=v      cookie passed to harvest and submit (repeatable)
+#   --data k=v        extra form fields for submit (repeatable)
+#   --timeout N       solver timeout seconds
+```
+
+If the harvested page looks like a Cloudflare challenge instead of the real
+page, the script warns and suggests solving the clearance first (see
+[cloudflare-invisible-solver](https://github.com/nexus956/cloudflare-invisible-solver))
+and passing `--cookie "cf_clearance=..."`.
